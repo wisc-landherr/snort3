@@ -31,6 +31,7 @@ SET( PLUGIN_LIST
     ips_itype.cc
     ips_msg.cc
     ips_pcre.cc
+    ips_jwt.cc
     ips_priority.cc
     ips_raw_data.cc
     ips_rem.cc
@@ -126,6 +127,7 @@ else (STATIC_IPS_OPTIONS)
     add_dynamic_module(ips_itype ips_options ips_itype.cc)
     add_dynamic_module(ips_msg ips_options ips_msg.cc)
     add_dynamic_module(ips_pcre ips_options ips_pcre.cc)
+    add_dynamic_module(ips_jwt ips_options ips_jwt.cc)
     add_dynamic_module(ips_priority ips_options ips_priority.cc)
     add_dynamic_module(ips_raw_data ips_options ips_raw_data.cc)
     add_dynamic_module(ips_rem ips_options ips_rem.cc)
