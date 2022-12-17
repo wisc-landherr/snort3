@@ -70,6 +70,16 @@ using namespace Poco::JWT;
 
 #define JWT_EXPRESSION "/[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/"
 
+#define JWT_CLAIM_EXP (1 << 0)
+#define JWT_CLAIM_SUB (1 << 1)
+#define JWT_CLAIM_ISS (1 << 2)
+#define JWT_CLAIM_IAT (1 << 3)
+#define JWT_CLAIM_NBF (1 << 4)
+#define JWT_HEADER_TYP (1 << 5)
+#define JWT_HEADER_ALG (1 << 6)
+
+static const Poco::Timestamp zero_ts = Poco::Timestamp(0);
+
 struct JwtPcreData
 {
     pcre* re;           /* compiled regex */
@@ -77,6 +87,7 @@ struct JwtPcreData
     bool free_pe;
     int options;        /* sp_pcre specific options (relative & inverse) */
     char* expression;
+    uint32_t jwt_claims;
 };
 
 // we need to specify the vector length for our pcre_exec call.  we only care
@@ -92,6 +103,59 @@ static unsigned scratch_index;
 static ScratchAllocator* scratcher = nullptr;
 
 static THREAD_LOCAL ProfileStats jwtPcrePerfStats;
+
+//-------------------------------------------------------------------------
+// stats
+//-------------------------------------------------------------------------
+
+struct JwtStats
+{
+    PegCount jwt_rules;
+#ifdef HAVE_HYPERSCAN
+    PegCount jwt_to_hyper;
+#endif
+    PegCount jwt_pcre_native;
+    PegCount jwt_missing_exp;
+    PegCount jwt_missing_sub;
+    PegCount jwt_missing_iss;
+    PegCount jwt_missing_iat;
+    PegCount jwt_missing_nbf;
+    PegCount jwt_alg_is_none;
+    PegCount jwt_typ_not_jwt;
+    PegCount jwt_config_exp;
+    PegCount jwt_config_sub;
+    PegCount jwt_config_iss;
+    PegCount jwt_config_iat;
+    PegCount jwt_config_nbf;
+    PegCount jwt_config_alg;
+    PegCount jwt_config_typ;
+};
+
+const PegInfo jwt_pegs[] =
+{
+    { CountType::SUM, "jwt_rules", "total rules processed with jwt option" },
+#ifdef HAVE_HYPERSCAN
+     { CountType::SUM, "jwt_to_hyper", "total jwt rules by hyperscan engine" },
+#endif
+    { CountType::SUM, "jwt_pcre_native", "total jwt rules compiled by pcre engine" },
+    { CountType::SUM, "jwt_missing_exp", "total jwts missing exp" },
+    { CountType::SUM, "jwt_missing_sub", "total jwts missing sub" },
+    { CountType::SUM, "jwt_missing_iss", "total jwts missing iss" },
+    { CountType::SUM, "jwt_missing_iat", "total jwts missing iat" },
+    { CountType::SUM, "jwt_missing_nbf", "total jwts missing nbf" },
+    { CountType::SUM, "jwt_alg_is_none", "total unsecured jwts" },
+    { CountType::SUM, "jwt_typ_not_jwt", "total jws not type JWT" },
+    { CountType::SUM, "jwt_config_exp", "total jwt exp rules" },
+    { CountType::SUM, "jwt_config_sub", "total jwts sub rules" },
+    { CountType::SUM, "jwt_config_iss", "total jwt iss rules" },
+    { CountType::SUM, "jwt_config_iat", "total jwt iat rules" },
+    { CountType::SUM, "jwt_config_nbf", "total jwt nbf rules" },
+    { CountType::SUM, "jwt_config_alg", "total jwt alg rules" },
+    { CountType::SUM, "jwt_config_typ", "total jwt typ rules" },
+    { CountType::END, nullptr, nullptr }
+};
+
+JwtStats jwt_stats;
 
 //-------------------------------------------------------------------------
 // implementation foo
@@ -159,7 +223,41 @@ static void jwt_pcre_check_anchored(JwtPcreData* pcre_data)
     }
 }
 
-static void jwt_pcre_parse(const SnortConfig* sc, const char* data, JwtPcreData* pcre_data)
+static void jwt_set_claims(JwtPcreData *pcre_data, const char *claims) {
+    uint32_t jwt_claims = 0;
+
+    if (strstr(claims, "exp")) {
+        jwt_claims |= JWT_CLAIM_EXP;
+        jwt_stats.jwt_config_exp++;
+    }
+    if (strstr(claims, "sub")) {
+        jwt_claims |= JWT_CLAIM_SUB;
+        jwt_stats.jwt_config_sub++;
+    }
+    if (strstr(claims, "iss")) {
+        jwt_claims |= JWT_CLAIM_ISS;
+        jwt_stats.jwt_config_iss++;
+    }
+    if (strstr(claims, "iat")) {
+        jwt_claims |= JWT_CLAIM_IAT;
+        jwt_stats.jwt_config_iat++;
+    }
+    if (strstr(claims, "nbf")) {
+        jwt_claims |= JWT_CLAIM_NBF;
+        jwt_stats.jwt_config_nbf++;
+    }
+    if (strstr(claims, "typ")) {
+        jwt_claims |= JWT_HEADER_TYP;
+        jwt_stats.jwt_config_typ++;
+    }
+    if (strstr(claims, "alg")) {
+        jwt_claims |= JWT_HEADER_ALG;
+        jwt_stats.jwt_config_alg++;
+    }
+    pcre_data->jwt_claims = jwt_claims;
+}
+
+static void jwt_parse(const SnortConfig* sc, const char* data, JwtPcreData* pcre_data)
 {
     const char* error;
     char* re, * free_me;
@@ -170,10 +268,12 @@ static void jwt_pcre_parse(const SnortConfig* sc, const char* data, JwtPcreData*
 
     if (data == nullptr || *data == '\0')
     {
-        free_me = snort_strdup(JWT_EXPRESSION);
+        jwt_set_claims(pcre_data, "exp");
     } else {
-        free_me = snort_strdup(data);
+        jwt_set_claims(pcre_data, data);
     }
+
+    free_me = snort_strdup(JWT_EXPRESSION);
     re = free_me;
 
     /* get rid of starting and ending whitespace */
@@ -546,13 +646,7 @@ bool JwtPcreOption::operator==(const IpsOption& ips) const
     JwtPcreData* left = config;
     JwtPcreData* right = rhs.config;
 
-    if (( strcmp(left->expression, right->expression) == 0) &&
-        ( left->options == right->options))
-    {
-        return true;
-    }
-
-    return false;
+    return left->jwt_claims == right->jwt_claims;
 }
 
 IpsOption::EvalStatus JwtPcreOption::eval(Cursor& c, Packet* p)
@@ -580,14 +674,49 @@ IpsOption::EvalStatus JwtPcreOption::eval(Cursor& c, Packet* p)
         if ( found_offset[1] > 0 )
         {
             std::string jwt((char *)c.buffer() + adj + found_offset[0], found_offset[1] - found_offset[0]);
+            Token token;
             try {
-                Token token = Token(jwt);
+                token = Token(jwt);
             } catch (ParseException ex) {
                 return NO_MATCH;
             }
             adj += found_offset[1];
             c.set_pos(adj);
             c.set_delta(adj);
+            bool claims_ok = true;
+            if ((config->jwt_claims & JWT_CLAIM_EXP) != 0 && token.getExpiration() == zero_ts) {
+                jwt_stats.jwt_missing_exp++;
+                claims_ok = false;
+            }
+            if ((config->jwt_claims & JWT_CLAIM_SUB) != 0 && token.getSubject().empty()) {
+                jwt_stats.jwt_missing_sub++;
+                claims_ok = false;
+            }
+            if ((config->jwt_claims & JWT_CLAIM_ISS) != 0 && token.getIssuer().empty()) {
+                jwt_stats.jwt_missing_iss++;
+                claims_ok = false;
+            }
+            if ((config->jwt_claims & JWT_CLAIM_IAT) != 0 && token.getIssuedAt() == zero_ts) {
+                jwt_stats.jwt_missing_iat++;
+                claims_ok = false;
+            }
+            if ((config->jwt_claims & JWT_CLAIM_NBF) != 0 && token.getNotBefore() == zero_ts) {
+                jwt_stats.jwt_missing_nbf++;
+                claims_ok = false;
+            }
+            if ((config->jwt_claims & JWT_HEADER_ALG) != 0 &&
+                    (token.getAlgorithm().empty() || strcasecmp(token.getAlgorithm().c_str(), "none") == 0)) {
+                jwt_stats.jwt_alg_is_none++;
+                claims_ok = false;
+            }
+            if ((config->jwt_claims & JWT_HEADER_TYP) != 0 &&
+                    (token.getType().empty() || token.getType() != "JWT")) {
+                jwt_stats.jwt_typ_not_jwt++;
+                claims_ok = false;
+            }
+            if (claims_ok) {
+                return NO_MATCH;
+            }
         }
         return MATCH;
     }
@@ -626,29 +755,6 @@ static const Parameter s_params[] =
 
     { nullptr, Parameter::PT_MAX, nullptr, nullptr, nullptr }
 };
-
-struct JwtPcreStats
-{
-    PegCount pcre_rules;
-#ifdef HAVE_HYPERSCAN
-    PegCount pcre_to_hyper;
-#endif
-    PegCount pcre_native;
-    PegCount pcre_negated;
-};
-
-const PegInfo jwt_pcre_pegs[] =
-{
-    { CountType::SUM, "pcre_rules", "total rules processed with pcre option" },
-#ifdef HAVE_HYPERSCAN
-    { CountType::SUM, "pcre_to_hyper", "total pcre rules by hyperscan engine" },
-#endif
-    { CountType::SUM, "pcre_native", "total pcre rules compiled by pcre engine" },
-    { CountType::SUM, "pcre_negated", "total pcre rules using negation syntax" },
-    { CountType::END, nullptr, nullptr }
-};
-
-JwtPcreStats jwt_pcre_stats;
 
 #define s_help \
     "rule option for matching jwt payload data"
@@ -692,7 +798,7 @@ public:
 private:
     JwtPcreData* data;
     Module* mod_regex = nullptr;
-    std::string re;
+    std::string claims;
 
     static bool scratch_setup(SnortConfig*);
     static void scratch_cleanup(SnortConfig*);
@@ -706,10 +812,10 @@ JwtPcreData* JwtPcreModule::get_data()
 }
 
 const PegInfo* JwtPcreModule::get_pegs() const
-{ return jwt_pcre_pegs; }
+{ return jwt_pegs; }
 
 PegCount* JwtPcreModule::get_counts() const
-{ return (PegCount*)&jwt_pcre_stats; }
+{ return (PegCount*)&jwt_stats; }
 
 #ifdef HAVE_HYPERSCAN
 bool JwtPcreModule::begin(const char* name, int v, SnortConfig* sc)
@@ -729,7 +835,7 @@ bool JwtPcreModule::begin(const char* name, int v, SnortConfig* sc)
 bool JwtPcreModule::set(const char* name, Value& v, SnortConfig* sc)
 {
     assert(v.is("~re"));
-    re = v.get_string();
+    claims = v.get_string();
 
     if( mod_regex )
         mod_regex = mod_regex->set(name, v, sc) ? mod_regex : nullptr;
@@ -745,7 +851,7 @@ bool JwtPcreModule::end(const char* name, int v, SnortConfig* sc)
     if ( !mod_regex )
     {
         data = (JwtPcreData*)snort_calloc(sizeof(*data));
-        jwt_pcre_parse(sc, re.c_str(), data);
+        jwt_parse(sc, claims.c_str(), data);
     }
 
     return true;
@@ -795,14 +901,14 @@ static void mod_dtor(Module* m)
 
 static IpsOption* pcre_ctor(Module* p, OptTreeNode* otn)
 {
-    jwt_pcre_stats.pcre_rules++;
+    jwt_stats.jwt_rules++;
     JwtPcreModule* m = (JwtPcreModule*)p;
 
 #ifdef HAVE_HYPERSCAN
     Module* mod_regex = m->get_mod_regex();
     if ( mod_regex )
     {
-        jwt_pcre_stats.pcre_to_hyper++;
+        jwt_stats.jwt_to_hyper++;
         const IpsApi* opt_api = IpsManager::get_option_api(mod_regex_name);
         return opt_api->ctor(mod_regex, otn);
     }
@@ -811,7 +917,7 @@ static IpsOption* pcre_ctor(Module* p, OptTreeNode* otn)
     UNUSED(otn);
 #endif
     {
-        jwt_pcre_stats.pcre_native++;
+        jwt_stats.jwt_pcre_native++;
         JwtPcreData* d = m->get_data();
         return new JwtPcreOption(d);
     }
